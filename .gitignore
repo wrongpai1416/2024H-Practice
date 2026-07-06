@@ -1,0 +1,13 @@
+# Build output
+Debug/
+
+# IDE
+.settings/
+.theia/
+.ccsproject
+.clangd
+.project
+
+# OS
+.DS_Store
+Thumbs.db
