@@ -1,5 +1,11 @@
 #include "gyro.h"
 #include "mpu6050.h"
+#include "delay.h"
+
+/* ========================================
+ *  陀螺仪开关：0=未接（跳过I2C），1=已接
+ * ======================================== */
+#define GYRO_ENABLE   1
 
 /* 陀螺仪 Z 轴零偏（开机校准） */
 static float gyro_offset = 0.0f;
@@ -12,6 +18,7 @@ volatile float gyro_yaw = 0.0f;
 
 void Gyro_Init(void)
 {
+#if GYRO_ENABLE
     MPU6050_Init();
 
     /* 零偏校准：静止状态采样 200 次取平均 */
@@ -21,7 +28,9 @@ void Gyro_Init(void)
         delay_ms(2);
     }
     gyro_offset = (float)sum / CALIB_SAMPLES;
-
+#else
+    gyro_offset = 0.0f;
+#endif
     gyro_yaw = 0.0f;
 }
 
@@ -32,12 +41,13 @@ void Gyro_Reset(void)
 
 void Gyro_Update(float dt)
 {
+#if GYRO_ENABLE
     int16_t raw = MPU6050_ReadGyroZ();
-    /* 减去零偏，转换为 °/s（±500°/s 模式，灵敏度 65.5） */
     float omega = ((float)raw - gyro_offset) / 65.5f;
-
-    /* 积分得到角度 */
     gyro_yaw += omega * dt;
+#else
+    (void)dt;
+#endif
 }
 
 float Gyro_GetYaw(void)

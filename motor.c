@@ -3,6 +3,9 @@
 #include "pid.h"
 #include "gyro.h"
 
+/* 10ms tick 计数（main.c 用它算时间） */
+volatile uint32_t tick_10ms = 0;
+
 /* ---------- 两个电机的 PID 控制器 ---------- */
 static PID_Controller pid_left;
 static PID_Controller pid_right;
@@ -73,9 +76,9 @@ void Motor_Init(void)
     Motor_Stop();
     DL_TimerG_startCounter(PWMAB_INST);
 
-    /* PID 参数：Kp, Ki, Kd, max_output, max_integral */
-    PID_Init(&pid_left,  17.0f, 0.8f, 0.3f, 1000.0f, 500.0f);
-    PID_Init(&pid_right, 15.0f, 0.8f, 0.3f, 1000.0f, 500.0f);
+    /* 电机速度 PID（保持原来能转的参数） */
+    PID_Init(&pid_left,  20.0f, 0.8f, 0.3f, 1000.0f, 500.0f);
+    PID_Init(&pid_right, 20.0f, 0.8f, 0.3f, 1000.0f, 500.0f);
 }
 
 /* ---------- 设置目标速度（外部调用） ---------- */
@@ -121,7 +124,8 @@ void MOTOR_PID_INST_IRQHandler(void)
     {
     case DL_TIMER_IIDX_LOAD:
         Motor_PID_Update();
-        Gyro_Update(0.01f);  /* 10ms 周期，积分陀螺仪角度 */
+        Gyro_Update(0.01f);
+        tick_10ms++;
         break;
     default:
         break;
