@@ -10,5 +10,6 @@ void Gyro_Init(void);
 void Gyro_Reset(void);           /* 重置 yaw 为 0 */
 void Gyro_Update(float dt);      /* 在定时中断中调用，dt=采样周期(秒) */
 float Gyro_GetYaw(void);         /* 获取当前 yaw 角度 */
+void Gyro_EnableAutoCal(void);   /* 使能运行时自动漂移补偿 */
 
 #endif

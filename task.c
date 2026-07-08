@@ -271,6 +271,7 @@ static void EnterNextStep(void)
         enc_diff_integral = 0.0f;
         prev_total_diff = 0;
         gyro_prev_error = 0.0f;
+        Gyro_EnableAutoCal();  /* 使能运行时自动漂移补偿 */
     } else {
         state = STATE_SEMI_TURN;
         Gyro_Reset();
@@ -298,10 +299,11 @@ void Task_Init(uint8_t task)
         straight_ms = 0;
         prev_left = encoder_left_cnt;
         prev_right = encoder_right_cnt;
-        straight_heading = Gyro_GetYaw() - 10.0f;  /* 左偏30°补偿右漂 */
+        straight_heading = Gyro_GetYaw() - 9.0f;  /* 右偏改大，左偏改小，每天可能不同 */
         enc_diff_integral = 0.0f;
         prev_total_diff = 0;
         gyro_prev_error = 0.0f;
+        Gyro_EnableAutoCal();  /* 使能运行时自动漂移补偿 */
     } else {
         state = STATE_SEMI_TURN;
         Gyro_Reset();
