@@ -83,24 +83,41 @@ GPIO3.associatedPins[8].direction = "INPUT";
 GPIO3.associatedPins[8].internalResistor = "PULL_DOWN";
 GPIO3.associatedPins[8].pin.$assign = "PB20";
 
-// 5路循迹传感器
+// 8路循迹传感器（加上拉电阻）
 GPIO4.$name = "HUIDU";
-GPIO4.associatedPins.create(5);
-GPIO4.associatedPins[0].$name = "L2";
+GPIO4.associatedPins.create(8);
+GPIO4.associatedPins[0].$name = "S1";
 GPIO4.associatedPins[0].direction = "INPUT";
-GPIO4.associatedPins[0].pin.$assign = "PA17";
-GPIO4.associatedPins[1].$name = "L1";
+GPIO4.associatedPins[0].internalResistor = "PULL_UP";
+GPIO4.associatedPins[0].pin.$assign = "PA18";
+GPIO4.associatedPins[1].$name = "S2";
 GPIO4.associatedPins[1].direction = "INPUT";
+GPIO4.associatedPins[1].internalResistor = "PULL_UP";
 GPIO4.associatedPins[1].pin.$assign = "PB8";
-GPIO4.associatedPins[2].$name = "M";
+GPIO4.associatedPins[2].$name = "S3";
 GPIO4.associatedPins[2].direction = "INPUT";
+GPIO4.associatedPins[2].internalResistor = "PULL_UP";
 GPIO4.associatedPins[2].pin.$assign = "PB9";
-GPIO4.associatedPins[3].$name = "R1";
+GPIO4.associatedPins[3].$name = "S4";
 GPIO4.associatedPins[3].direction = "INPUT";
-GPIO4.associatedPins[3].pin.$assign = "PA24";
-GPIO4.associatedPins[4].$name = "R2";
+GPIO4.associatedPins[3].internalResistor = "PULL_UP";
+GPIO4.associatedPins[3].pin.$assign = "PA23";
+GPIO4.associatedPins[4].$name = "S5";
 GPIO4.associatedPins[4].direction = "INPUT";
-GPIO4.associatedPins[4].pin.$assign = "PA2";
+GPIO4.associatedPins[4].internalResistor = "PULL_UP";
+GPIO4.associatedPins[4].pin.$assign = "PA24";
+GPIO4.associatedPins[5].$name = "S6";
+GPIO4.associatedPins[5].direction = "INPUT";
+GPIO4.associatedPins[5].internalResistor = "PULL_UP";
+GPIO4.associatedPins[5].pin.$assign = "PA25";
+GPIO4.associatedPins[6].$name = "S7";
+GPIO4.associatedPins[6].direction = "INPUT";
+GPIO4.associatedPins[6].internalResistor = "PULL_UP";
+GPIO4.associatedPins[6].pin.$assign = "PA26";
+GPIO4.associatedPins[7].$name = "S8";
+GPIO4.associatedPins[7].direction = "INPUT";
+GPIO4.associatedPins[7].internalResistor = "PULL_UP";
+GPIO4.associatedPins[7].pin.$assign = "PA27";
 
 // MPU6050 陀螺仪 (I2C1, PA15=SCL, PA16=SDA)
 I2C3.$name = "MPU6050";

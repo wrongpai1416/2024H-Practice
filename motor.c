@@ -88,46 +88,4 @@ void Motor_SetTarget(float left, float right)
     target_right = right;
 }
 
-/* ---------- 10ms PID 定时中断中调用 ---------- */
-void Motor_PID_Update(void)
-{
-    /* 1. 读取编码器增量（10ms 内的脉冲数） */
-    static int32_t last_left_cnt  = 0;
-    static int32_t last_right_cnt = 0;
-
-    int32_t cur_left  = encoder_left_cnt;
-    int32_t cur_right = encoder_right_cnt;
-
-    speed_left  = (float)(cur_left  - last_left_cnt);
-    speed_right = (float)(cur_right - last_right_cnt);
-
-    last_left_cnt  = cur_left;
-    last_right_cnt = cur_right;
-
-    /* 2. 设置 PID 目标 */
-    pid_left.target  = target_left;
-    pid_right.target = target_right;
-
-    /* 3. 计算 PID 输出 */
-    float out_left  = PID_Calculate(&pid_left,  speed_left);
-    float out_right = PID_Calculate(&pid_right, speed_right);
-
-    /* 4. 设置 PWM（输出直接作为占空比 0~1000） */
-    Motor_SetLeft((int16_t)out_left);
-    Motor_SetRight((int16_t)out_right);
-}
-
-/* ---------- TIMA0 中断：PID 周期（10ms） ---------- */
-void MOTOR_PID_INST_IRQHandler(void)
-{
-    switch (DL_Timer_getPendingInterrupt(MOTOR_PID_INST))
-    {
-    case DL_TIMER_IIDX_LOAD:
-        Motor_PID_Update();
-        Gyro_Update(0.01f);
-        tick_10ms++;
-        break;
-    default:
-        break;
-    }
-}
+/* 注意：定时中断处理已移至 task.c 的 MOTOR_PID_INST_IRQHandler */

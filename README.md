@@ -1,41 +1,185 @@
-## Example Summary
+# 2024年H题 - 自动行驶小车
 
-Empty project using DriverLib.
-This example shows a basic empty project using DriverLib with just main file
-and SysConfig initialization.
+## 题目描述
 
-## Peripherals & Pin Assignments
+设计一辆自动行驶小车，能够在椭圆赛道上完成以下任务：
 
-| Peripheral | Pin | Function |
-| --- | --- | --- |
-| SYSCTL |  |  |
-| DEBUGSS | PA20 | Debug Clock |
-| DEBUGSS | PA19 | Debug Data In Out |
+### 任务要求
 
-## BoosterPacks, Board Resources & Jumper Settings
+| 任务 | 说明 |
+|------|------|
+| 任务1 | A→B 直线行驶（白区，编码器计距离） |
+| 任务2 | A→B→C→D→A 完整一圈（含直线+半圆弧） |
+| 任务3 | A→C→B→D→A 反向一圈 |
+| 任务4 | 多圈行驶 |
 
-Visit [LP_MSPM0G3507](https://www.ti.com/tool/LP-MSPM0G3507) for LaunchPad information, including user guide and hardware files.
+### 赛道示意
 
-| Pin | Peripheral | Function | LaunchPad Pin | LaunchPad Settings |
-| --- | --- | --- | --- | --- |
-| PA20 | DEBUGSS | SWCLK | N/A | <ul><li>PA20 is used by SWD during debugging<br><ul><li>`J101 15:16 ON` Connect to XDS-110 SWCLK while debugging<br><li>`J101 15:16 OFF` Disconnect from XDS-110 SWCLK if using pin in application</ul></ul> |
-| PA19 | DEBUGSS | SWDIO | N/A | <ul><li>PA19 is used by SWD during debugging<br><ul><li>`J101 13:14 ON` Connect to XDS-110 SWDIO while debugging<br><li>`J101 13:14 OFF` Disconnect from XDS-110 SWDIO if using pin in application</ul></ul> |
+```
+    B ←————— A
+    |         |
+    |  半圆   |
+    |         |
+    C ——————→ D
+```
 
-### Device Migration Recommendations
-This project was developed for a superset device included in the LP_MSPM0G3507 LaunchPad. Please
-visit the [CCS User's Guide](https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/tools/ccs_ide_guide/doc_guide/doc_guide-srcs/ccs_ide_guide.html#sysconfig-project-migration)
-for information about migrating to other MSPM0 devices.
+- AB、CD 段：白区直线，使用编码器+陀螺仪保持直行
+- BC、DA 段：黑线半圆弧，使用 8 路循迹传感器巡线
 
-### Low-Power Recommendations
-TI recommends to terminate unused pins by setting the corresponding functions to
-GPIO and configure the pins to output low or input with internal
-pullup/pulldown resistor.
+---
 
-SysConfig allows developers to easily configure unused pins by selecting **Board**→**Configure Unused Pins**.
+## 硬件平台
 
-For more information about jumper configuration to achieve low-power using the
-MSPM0 LaunchPad, please visit the [LP-MSPM0G3507 User's Guide](https://www.ti.com/lit/slau873).
+| 项目 | 型号 |
+|------|------|
+| 主控芯片 | MSPM0G3507 (TI MSPM0 系列) |
+| 主频 | 80MHz (外部晶振 40MHz + PLL) |
+| 封装 | LQFP-64 |
+| SDK | mspm0_sdk@2.10.00.04 |
 
-## Example Usage
+---
 
-Compile, load and run the example.
+## 引脚接线表
+
+### 电机驱动 (TB6612FNG)
+
+| 功能 | 引脚 | 说明 |
+|------|------|------|
+| AIN1 | PA8 | 左电机方向1 |
+| AIN2 | PA9 | 左电机方向2 |
+| BIN1 | PA0 | 右电机方向1 |
+| BIN2 | PA1 | 右电机方向2 |
+| PWMA | PA12 | 左电机PWM (TIMG0_CH0, 20kHz) |
+| PWMB | PA13 | 右电机PWM (TIMG0_CH1, 20kHz) |
+| STBY | PB24 | TB6612 使能 |
+
+### 编码器 (双路增量式)
+
+| 功能 | 引脚 | 说明 |
+|------|------|------|
+| 左编码器A | PA21 | GPIO中断，上升沿触发 |
+| 左编码器B | PA22 | GPIO输入，判断方向 |
+| 右编码器A | PB19 | GPIO中断，上升沿触发 |
+| 右编码器B | PB20 | GPIO输入，判断方向 |
+
+### 8路循迹传感器 (红外)
+
+| 传感器 | 引脚 | 位置 |
+|--------|------|------|
+| S1 | PA18 | 最右 |
+| S2 | PB8 | 右2 |
+| S3 | PB9 | 右3 |
+| S4 | PA23 | 右4 |
+| S5 | PA24 | 左4 |
+| S6 | PA25 | 左3 |
+| S7 | PA26 | 左2 |
+| S8 | PA27 | 最左 |
+
+> 所有传感器配置为输入模式，内部上拉电阻
+
+### 陀螺仪 (MPU6050)
+
+| 功能 | 引脚 | 说明 |
+|------|------|------|
+| SCL | PA15 | I2C1 时钟 |
+| SDA | PA16 | I2C1 数据 |
+
+### OLED 显示屏 (0.96寸, I2C模拟)
+
+| 功能 | 引脚 | 说明 |
+|------|------|------|
+| SCL | PB2 | GPIO模拟I2C时钟 |
+| SDA | PB3 | GPIO模拟I2C数据 |
+
+### 其他
+
+| 功能 | 引脚 | 说明 |
+|------|------|------|
+| LED/蜂鸣器 | PA14 | 高电平有效 |
+| SWCLK | PA20 | 调试时钟 |
+| SWDIO | PA19 | 调试数据 |
+
+---
+
+## 软件架构
+
+```
+├── main.c          # 主程序，选择任务号
+├── task.c          # 任务控制（分段判断、循迹、PID）
+├── motor.c         # 电机驱动 + 速度PID
+├── encoder.c       # 编码器中断计数
+├── ir_sensor.c     # 8路循迹传感器读取
+├── gyro.c          # 陀螺仪（MPU6050）+ 漂移补偿
+├── oled.c          # OLED显示驱动
+├── buzzer.c        # 蜂鸣器
+├── pid.c           # PID算法
+└── empty.syscfg    # SysConfig 引脚配置
+```
+
+### 控制策略
+
+1. **直线段 (AB/CD)**
+   - 编码器计距离
+   - 陀螺仪航向PD控制保持直行
+   - 编码器差速PID修正左右轮
+
+2. **圆弧段 (BC/DA)**
+   - 8路传感器加权求和计算偏差
+   - 循迹PID修正方向
+
+3. **定时中断**
+   - TIMA0 10ms 周期中断
+   - 中断内完成：分段判断 + 循迹/直线控制 + 速度PID
+
+---
+
+## 使用方法
+
+### 1. 修改任务号
+
+在 `main.c` 第 78 行修改：
+
+```c
+#define TASK_NUM    1   // 0=调试 / 1 / 2 / 3 / 4
+```
+
+### 2. 调参
+
+| 参数 | 位置 | 说明 |
+|------|------|------|
+| BASE_SPEED | task.c:42 | 基础速度 |
+| KP_LINE | task.c:44 | 循迹比例系数 |
+| DIST_AB_PULSES | task.c:52 | AB段脉冲数 |
+| Kp1/Ki1/Kd1 | task.c:47-49 | 速度PID |
+
+### 3. 编译烧录
+
+使用 TI Code Composer Studio (CCS) 或 SysConfig 工具：
+
+1. 打开 `empty.syscfg` 配置引脚
+2. 编译生成固件
+3. 通过 SWD 烧录到 MSPM0G3507
+
+---
+
+## 调试模式
+
+设置 `TASK_NUM=0` 进入调试模式，OLED 显示：
+- 左编码器脉冲数
+- 右编码器脉冲数
+- 陀螺仪 Yaw 角度
+
+---
+
+## 注意事项
+
+1. **编码器校准**：让车走 1 米，记录脉冲数，更新 `PULSES_PER_CM`
+2. **陀螺仪校准**：开机自动校准 500 次采样，运行时自动漂移补偿
+3. **循迹传感器**：黑线为低电平，白区为高电平（内部上拉）
+4. **电机方向**：如果电机反转，交换 AIN1/AIN2 或 BIN1/BIN2 接线
+
+---
+
+## 开源协议
+
+MIT License

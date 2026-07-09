@@ -1,393 +1,303 @@
 /*
- * H题任务状态机
+ * H题自动行驶小车 - 8路循迹版
  *
- * 场地布局（只有半圆弧是黑线，直线段是白的）：
- *        A                   B
- *        |                   |
- *     左半圆(A-C)         右半圆(B-D)
- *        |                   |
- *        C                   D
+ * 控制方式：定时中断里做所有控制（循迹/直线 + 速度PID）
  *
- * 任务1：A→B（白区直线，编码器+陀螺仪）
- * 任务2：A→B→C→D→A
- * 任务3：A→C→B→D→A
- * 任务4：任务3路径 ×4圈
+ * =============================================
+ *  改这里选任务：1 / 2 / 3 / 4
+ * =============================================
+ *  TASK_NUM 在 main.c 里
  *
- * 直线段：陀螺仪保持方向 + 编码器计距离
- * 半圆弧段：循迹检测进入 → 陀螺仪转180° → 循迹出来
+ * =============================================
+ *  可调参数速查
+ * =============================================
+ *
+ *  【循迹速度】 → 第 40 行
+ *    Speed_Middle = 30  ← 基础速度（PWM占空比 0~3800）
+ *
+ *  【循迹力度】 → 第 43 行
+ *    KP_LINE = 10       ← 循迹比例系数，太大抖，太小偏
+ *
+ *  【速度PID】 → 第 46~48 行
+ *    Kp1=40, Ki1=0.13, Kd1=0.1  ← 速度环PID
+ *
+ *  【直线段距离】 → 第 54~55 行
+ *    DIST_AB_PULSES = 3000  ← A到B编码器脉冲数
+ *    DIST_CD_PULSES = 3000  ← C到D编码器脉冲数
+ *
+ *  【传感器阈值】 → 第 58~62 行
+ *    Black_CNT = 30   ← 连续检测到黑线N次才判定到达
+ *    White_CNT = 1000 ← 连续检测到白区N次才判定离开
  */
 
 #include "task.h"
 #include "motor.h"
 #include "ir_sensor.h"
-#include "gyro.h"
 #include "buzzer.h"
 #include "oled.h"
 #include "delay.h"
 #include "encoder.h"
 
-/* ---------- 参数可调 ---------- */
-#define BASE_SPEED          20.0f   /* 直线基础速度 */
-#define LOST_SPEED          10.0f   /* 丢线低速 */
-#define TURN_SPEED          18.0f   /* 半圆弧基础速度 */
-#define TURN_TARGET_ANGLE   175.0f  /* 半圆弧目标转角（度） */
-#define TURN_ANGLE_TOL      8.0f   /* 转角容差 */
-#define TURN_KP             0.8f   /* 转向 Kp */
-#define TURN_KD             0.3f   /* 转向 Kd */
-#define CURVE_ENTER_THRESH  180.0f /* 进入半圆弧的循迹误差阈值 */
-#define CURVE_ENTER_COUNT   3      /* 连续检测到弯道次数 */
-#define POINT_DELAY_MS      300    /* 到达点位声光持续时间 */
+/* ---------- 速度参数 ---------- */
+#define Speed_Middle    10.0f       /* 基础速度（PWM占空比） */
+#define Limit           2000        /* PWM限幅 */
+#define KP_LINE         8.0f       /* 循迹比例系数 */
 
-/* 直线段参数 */
-#define STRAIGHT_KP         2.5f   /* 直线保持 Kp */
-#define PULSES_PER_CM       100.0f /* 编码器脉冲/厘米（实测值） */
-#define MAX_STRAIGHT_MS     15000  /* 直线段最大时间(ms) */
+/* ---------- 速度PID（增量式） ---------- */
+#define Kp1             20.0f
+#define Ki1             0.1f
+#define Kd1             0.05f
 
-/* 直线保持参数：编码器累计差 + 陀螺仪航向 */
-#define ENC_DIFF_KP         0.35f  /* 编码器累计差 P */
-#define ENC_DIFF_KI         0.03f  /* 编码器累计差 I */
-#define ENC_DIFF_KD         0.15f  /* 编码器瞬时差 D */
-#define ENC_DIFF_MAX_I      3.0f   /* I 项限幅 */
-#define GYRO_KP             1.6f   /* 陀螺仪航向 P */
-#define GYRO_KD             0.4f   /* 陀螺仪航向 D */
-#define STEERING_MAX        5.0f   /* 总修正量限幅 */
+/* ---------- 直线段距离（编码器脉冲数，需要实测） ---------- */
+#define DIST_AB_PULSES  2400        /* A→B 脉冲数 */
+#define DIST_CD_PULSES  2400        /* C→D 脉冲数 */
 
-/* 各段距离（厘米） */
-#define DIST_AB_CM          15.0f
-#define DIST_CD_CM          15.0f
+/* ---------- 分段判定阈值 ---------- */
+#define Black_CNT       30          /* 连续检测到黑线次数 */
+#define White_CNT       1000        /* 连续检测到白区次数 */
 
-/* ---------- 内部状态 ---------- */
-static TaskState  state        = STATE_IDLE;
-static uint8_t    task_num     = 0;
-static uint8_t    finished     = 0;
+/* ---------- flag 定义 ----------
+ * 0 = 停止
+ * 1 = AB段（白区直线，编码器计距离）
+ * 2 = BC段（半圆弧，循迹）
+ * 3 = CD段（白区直线，编码器计距离）
+ * 4 = DA段（半圆弧，循迹）
+ * ---------------------------- */
 
-/* 路径定义: 0=直线, 1=右半圆, -1=左半圆 */
-#define MAX_STEPS 8
-static int8_t   step_types[MAX_STEPS];
-static uint16_t step_dist_pulses[MAX_STEPS];
-static uint8_t  step_count = 0;
-static uint8_t  step_idx   = 0;
+static volatile int flag = 0;           /* 当前段 */
+static volatile int flag_en = 0;        /* 使能标志 */
+static volatile uint8_t finished = 0;
 
-/* 半圆弧转向 PID */
-static float turn_integral   = 0.0f;
-static float turn_prev_error = 0.0f;
-static uint8_t curve_enter_cnt = 0;
+/* 编码器速度（10ms 内脉冲数） */
+static volatile int32_t EncoderA_VEL = 0;  /* 左轮速度 */
+static volatile int32_t EncoderB_VEL = 0;  /* 右轮速度 */
 
-/* 直线段 */
-static uint32_t straight_pulses = 0;
-static int32_t  straight_start_left = 0;  /* 起始左编码器值 */
-static float    straight_heading = 0.0f;
-static uint32_t straight_ms = 0;
-static float    enc_diff_integral = 0.0f;   /* 编码器累计差 I 项 */
-static int32_t  prev_total_diff   = 0;      /* 上一帧累计差（用于 D 项） */
-static float    gyro_prev_error   = 0.0f;   /* 陀螺仪航向上一帧误差 */
+/* 增量式PID 状态 */
+static float pid_left_pwm = 0;
+static float pid_right_pwm = 0;
 
-/* 圈数 */
-static uint8_t lap_count = 0;
-static uint8_t total_laps = 1;
-
-/* ---------- 内部函数 ---------- */
-
-static void BuildPath(uint8_t task)
+/* ---------- 增量式PID ---------- */
+static float PID_Inc(float Encoder, float Target, float *last_bias, float *last2_bias)
 {
-    step_idx = 0;
-    lap_count = 0;
-
-    uint16_t dist_ab = (uint16_t)(DIST_AB_CM * PULSES_PER_CM);
-    uint16_t dist_cd = (uint16_t)(DIST_CD_CM * PULSES_PER_CM);
-
-    if (task == 1) {
-        step_types[0] = 0;
-        step_dist_pulses[0] = dist_ab;
-        step_count = 1;
-        total_laps = 1;
-    }
-    else if (task == 2) {
-        step_types[0] = 0;   step_dist_pulses[0] = dist_ab;   /* A→B */
-        step_types[1] = 1;                                      /* B→D 右半圆 */
-        step_types[2] = 0;   step_dist_pulses[2] = dist_cd;   /* D→C */
-        step_types[3] = -1;                                     /* C→A 左半圆 */
-        step_count = 4;
-        total_laps = 1;
-    }
-    else if (task == 3 || task == 4) {
-        step_types[0] = -1;                                     /* A→C 左半圆 */
-        step_types[1] = 0;   step_dist_pulses[1] = dist_cd;   /* C→B */
-        step_types[2] = 1;                                      /* B→D 右半圆 */
-        step_types[3] = 0;   step_dist_pulses[3] = dist_ab;   /* D→A */
-        step_count = 4;
-        total_laps = (task == 4) ? 4 : 1;
-    }
+    float Bias = Target - Encoder;
+    float Pwm = Kp1 * (Bias - *last_bias) + Ki1 * Bias + Kd1 * (Bias - 2 * (*last_bias) + (*last2_bias));
+    *last2_bias = *last_bias;
+    *last_bias = Bias;
+    return Pwm;
 }
 
-static void SignalArrival(void)
+/* ---------- 限幅 ---------- */
+static float PWM_Limit(float IN, float max, float min)
 {
-    Buzzer_ShortBeep();
+    if (IN > max) return max;
+    if (IN < min) return min;
+    return IN;
 }
 
-/* 白区直线行驶：编码器(PID) + 陀螺仪(PD) 双重修正 */
-static int32_t prev_left = 0, prev_right = 0;
-
-static void StraightStep(void)
+/* ---------- 设置电机PWM（直接操作方向引脚+PWM） ---------- */
+static void Set_Pwm(int Left, int Right)
 {
-    straight_ms += 10;
-
-    /* 用单边编码器计距离（取绝对值，防转圈时不算距离） */
-    int32_t cur_left = encoder_left_cnt;
-    int32_t diff_left = cur_left - straight_start_left;
-    if (diff_left < 0) diff_left = -diff_left;
-    straight_pulses = (uint32_t)diff_left;
-
-    /* ---- 1. 编码器累计位移差(PID) ---- */
-    int32_t total_diff = encoder_left_cnt - encoder_right_cnt;
-
-    enc_diff_integral += (float)total_diff;
-    if (enc_diff_integral >  ENC_DIFF_MAX_I) enc_diff_integral =  ENC_DIFF_MAX_I;
-    if (enc_diff_integral < -ENC_DIFF_MAX_I) enc_diff_integral = -ENC_DIFF_MAX_I;
-
-    float d_term = (float)(total_diff - prev_total_diff);
-    prev_total_diff = total_diff;
-
-    float enc_correction = ENC_DIFF_KP * (float)total_diff
-                         + ENC_DIFF_KI * enc_diff_integral
-                         + ENC_DIFF_KD * d_term;
-
-    /* ---- 2. 陀螺仪航向修正(PD) ---- */
-    float heading_err = Gyro_GetYaw() - straight_heading;
-    float heading_d = heading_err - gyro_prev_error;
-    gyro_prev_error = heading_err;
-
-    float gyro_correction = -(GYRO_KP * heading_err
-                           + GYRO_KD * heading_d);
-
-    /* ---- 3. 合并 ---- */
-    float correction = enc_correction + gyro_correction;
-    if (correction >  STEERING_MAX) correction =  STEERING_MAX;
-    if (correction < -STEERING_MAX) correction = -STEERING_MAX;
-
-    Motor_SetTarget(BASE_SPEED + correction,
-                    BASE_SPEED - correction);
-}
-
-static uint8_t IsStraightDone(void)
-{
-    /* 编码器距离到了 */
-    if (straight_pulses >= step_dist_pulses[step_idx])
-        return 1;
-    /* 超时保底 */
-    if (straight_ms >= MAX_STRAIGHT_MS)
-        return 1;
-    return 0;
-}
-
-/* 循迹控制 */
-static float LineFollowStep(void)
-{
-    uint8_t vals[IR_NUM];
-    IR_Read(vals);
-    int16_t error = IR_GetError(vals);
-
-    if (vals[0] == 0 && vals[1] == 0 && vals[2] == 0 &&
-        vals[3] == 0 && vals[4] == 0) {
-        Motor_SetTarget(LOST_SPEED, LOST_SPEED);
-        return 0.0f;
-    }
-
-    float abs_err = (float)(error > 0 ? error : -error);
-    float correction;
-
-    if (abs_err < 100.0f)
-        correction = abs_err * 0.02f;
-    else if (abs_err < 250.0f)
-        correction = abs_err * 0.07f;
-    else
-        correction = abs_err * 0.15f;
-
-    if (error > 0)
-        Motor_SetTarget(BASE_SPEED + correction, BASE_SPEED - correction);
-    else
-        Motor_SetTarget(BASE_SPEED - correction, BASE_SPEED + correction);
-
-    return abs_err;
-}
-
-/* 半圆弧转向 */
-static void SemiTurnStep(TurnDir dir)
-{
-    float yaw = Gyro_GetYaw();
-    float angle_error;
-
-    if (dir == TURN_RIGHT)
-        angle_error = TURN_TARGET_ANGLE - yaw;
-    else
-        angle_error = (-TURN_TARGET_ANGLE) - yaw;
-
-    turn_integral += angle_error;
-    if (turn_integral >  500.0f) turn_integral =  500.0f;
-    if (turn_integral < -500.0f) turn_integral = -500.0f;
-
-    float derivative = angle_error - turn_prev_error;
-    turn_prev_error = angle_error;
-
-    float pid_out = TURN_KP * angle_error
-                  + 0.0f * turn_integral
-                  + TURN_KD * derivative;
-
-    Motor_SetTarget(TURN_SPEED + pid_out, TURN_SPEED - pid_out);
-}
-
-static uint8_t IsSemiTurnDone(TurnDir dir)
-{
-    float yaw = Gyro_GetYaw();
-    if (dir == TURN_RIGHT)
-        return (yaw >= (TURN_TARGET_ANGLE - TURN_ANGLE_TOL));
-    else
-        return (yaw <= (-TURN_TARGET_ANGLE + TURN_ANGLE_TOL));
-}
-
-static void EnterNextStep(void)
-{
-    step_idx++;
-
-    if (step_idx >= step_count) {
-        lap_count++;
-        if (lap_count >= total_laps) {
-            state = STATE_STOP;
-            return;
-        }
-        step_idx = 0;
-    }
-
-    int8_t next_type = step_types[step_idx];
-
-    if (next_type == 0) {
-        state = STATE_LINE_FOLLOW;
-        straight_start_left = encoder_left_cnt;
-        straight_pulses = 0;
-        straight_ms = 0;
-        prev_left = encoder_left_cnt;
-        prev_right = encoder_right_cnt;
-        straight_heading = Gyro_GetYaw();
-        enc_diff_integral = 0.0f;
-        prev_total_diff = 0;
-        gyro_prev_error = 0.0f;
-        Gyro_EnableAutoCal();  /* 使能运行时自动漂移补偿 */
+    if (Left > 0) {
+        DL_GPIO_setPins(MOTOR_AIN1_PORT, MOTOR_AIN1_PIN);
+        DL_GPIO_clearPins(MOTOR_AIN2_PORT, MOTOR_AIN2_PIN);
     } else {
-        state = STATE_SEMI_TURN;
-        Gyro_Reset();
-        turn_integral = 0.0f;
-        turn_prev_error = 0.0f;
-        curve_enter_cnt = 0;
+        DL_GPIO_clearPins(MOTOR_AIN1_PORT, MOTOR_AIN1_PIN);
+        DL_GPIO_setPins(MOTOR_AIN2_PORT, MOTOR_AIN2_PIN);
+    }
+    DL_TimerG_setCaptureCompareValue(PWMAB_INST, (uint32_t)(Left > 0 ? Left : -Left),
+                                     DL_TIMER_CC_0_INDEX);
+
+    if (Right > 0) {
+        DL_GPIO_setPins(MOTOR_BIN1_PORT, MOTOR_BIN1_PIN);
+        DL_GPIO_clearPins(MOTOR_BIN2_PORT, MOTOR_BIN2_PIN);
+    } else {
+        DL_GPIO_clearPins(MOTOR_BIN1_PORT, MOTOR_BIN1_PIN);
+        DL_GPIO_setPins(MOTOR_BIN2_PORT, MOTOR_BIN2_PIN);
+    }
+    DL_TimerG_setCaptureCompareValue(PWMAB_INST, (uint32_t)(Right > 0 ? Right : -Right),
+                                     DL_TIMER_CC_1_INDEX);
+}
+
+/* ---------- 8路循迹加权求和（参考 CAR/Sensor.c） ----------
+ * S1=最右(+12), S2=+9, S3=+7, S4=+3,
+ * S5=-3, S6=-7, S7=-9, S8=最左(-12)
+ * 返回值：正=线偏右，负=线偏左
+ * ----------------------------------------------- */
+static int Incremental_Quantity(void)
+{
+    uint8_t v[IR_NUM];
+    IR_Read(v);
+
+    int value = 0;
+    if (v[0]) value += 12;   /* S1 最右 */
+    if (v[1]) value += 9;    /* S2 */
+    if (v[2]) value += 7;    /* S3 */
+    if (v[3]) value += 3;    /* S4 */
+    if (v[4]) value -= 3;    /* S5 */
+    if (v[5]) value -= 7;    /* S6 */
+    if (v[6]) value -= 9;    /* S7 */
+    if (v[7]) value -= 12;   /* S8 最左 */
+    return value;
+}
+
+/* ---------- 读取编码器速度（10ms 调用一次） ---------- */
+static void Read_Encoder(void)
+{
+    static int32_t last_left = 0, last_right = 0;
+
+    int32_t cur_left = encoder_left_cnt;
+    int32_t cur_right = encoder_right_cnt;
+
+    EncoderA_VEL = cur_left - last_left;
+    EncoderB_VEL = cur_right - last_right;
+
+    last_left = cur_left;
+    last_right = cur_right;
+}
+
+/* ---------- 分段判断（参考 CAR/Sensor.c Follow_Route） ---------- */
+static void Follow_Route(void)
+{
+    static int cnt = 0;
+    uint8_t v[IR_NUM];
+
+    /* 任务1：A→B 直线 */
+    if (flag == 1) {
+        /* 编码器距离到了 */
+        if (encoder_left_cnt >= DIST_AB_PULSES) {
+            flag = 0;  /* 停止 */
+            finished = 1;
+        }
+    }
+    /* 任务2/3/4 的 BC 段（半圆弧循迹） */
+    else if (flag == 2) {
+        IR_Read(v);
+        /* 全部白 → 离开黑线 → 到达下一个点 */
+        if (!(v[0] || v[1] || v[2] || v[3] || v[4] || v[5] || v[6] || v[7])) {
+            cnt++;
+            if (cnt > White_CNT) {
+                flag = 3;  /* 进入 CD 段 */
+                cnt = 0;
+            }
+        } else {
+            cnt = 0;
+        }
+    }
+    /* CD 段（白区直线） */
+    else if (flag == 3) {
+        if (encoder_left_cnt >= DIST_AB_PULSES + DIST_CD_PULSES) {
+            flag = 4;  /* 进入 DA 段 */
+        }
+    }
+    /* DA 段（半圆弧循迹） */
+    else if (flag == 4) {
+        IR_Read(v);
+        if (!(v[0] || v[1] || v[2] || v[3] || v[4] || v[5] || v[6] || v[7])) {
+            cnt++;
+            if (cnt > White_CNT) {
+                flag = 0;  /* 一圈完成 */
+                finished = 1;
+                cnt = 0;
+            }
+        } else {
+            cnt = 0;
+        }
     }
 }
 
-/* ---------- 外部接口 ---------- */
+/* ---------- 定时中断中的控制函数（参考 CAR/control.c Control） ---------- */
+static void Control(void)
+{
+    float TargetA, TargetB;
+    float bias = 0;
+
+    /* 分段判断 */
+    Follow_Route();
+
+    if (flag == 0 || !flag_en) {
+        Set_Pwm(0, 0);
+        pid_left_pwm = 0;
+        pid_right_pwm = 0;
+        return;
+    }
+
+    /* 根据当前段选择控制方式 */
+    if (flag == 1 || flag == 3) {
+        /* 白区直线：直走，不加循迹修正 */
+        bias = -3;
+    } else if (flag == 2 || flag == 4) {
+        /* 半圆弧：循迹 */
+        bias = KP_LINE * (float)Incremental_Quantity();
+    }
+
+    /* 计算目标速度 */
+    TargetA = Speed_Middle - bias;   /* 左轮 */
+    TargetB = Speed_Middle + bias;   /* 右轮 */
+
+    /* 读取编码器 */
+    Read_Encoder();
+
+    /* 增量式PID */
+    static float last_bias_a = 0, last2_bias_a = 0;
+    static float last_bias_b = 0, last2_bias_b = 0;
+
+    pid_left_pwm  += PID_Inc((float)EncoderA_VEL, TargetA, &last_bias_a, &last2_bias_a);
+    pid_right_pwm += PID_Inc((float)EncoderB_VEL, TargetB, &last_bias_b, &last2_bias_b);
+
+    /* 限幅 */
+    pid_left_pwm  = PWM_Limit(pid_left_pwm, Limit, -Limit);
+    pid_right_pwm = PWM_Limit(pid_right_pwm, Limit, -Limit);
+
+    /* 输出 */
+    Set_Pwm((int)pid_left_pwm, (int)pid_right_pwm);
+}
+
+/* ========== 外部接口 ========== */
 
 void Task_Init(uint8_t task)
 {
-    task_num  = task;
-    finished  = 0;
-    lap_count = 0;
+    finished = 0;
+    flag_en = 0;
+    pid_left_pwm = 0;
+    pid_right_pwm = 0;
+    encoder_left_cnt = 0;
+    encoder_right_cnt = 0;
 
-    BuildPath(task);
-
-    int8_t first_type = step_types[0];
-    if (first_type == 0) {
-        state = STATE_LINE_FOLLOW;
-        straight_start_left = encoder_left_cnt;
-        straight_pulses = 0;
-        straight_ms = 0;
-        prev_left = encoder_left_cnt;
-        prev_right = encoder_right_cnt;
-        straight_heading = Gyro_GetYaw() - 9.0f;  /* 右偏改大，左偏改小，每天可能不同 */
-        enc_diff_integral = 0.0f;
-        prev_total_diff = 0;
-        gyro_prev_error = 0.0f;
-        Gyro_EnableAutoCal();  /* 使能运行时自动漂移补偿 */
-    } else {
-        state = STATE_SEMI_TURN;
-        Gyro_Reset();
-        turn_integral = 0.0f;
-        turn_prev_error = 0.0f;
+    if (task == 1) {
+        flag = 1;   /* A→B 直线 */
+    } else if (task == 2) {
+        flag = 1;   /* A→B→C→D→A，从 AB 直线开始 */
+    } else if (task == 3) {
+        flag = 2;   /* A→C→B→D→A，从半圆弧开始 */
+    } else if (task == 4) {
+        flag = 2;   /* 4圈，从半圆弧开始 */
     }
 
-    curve_enter_cnt = 0;
-
-    SignalArrival();
+    Buzzer_ShortBeep();
     delay_ms(200);
+    flag_en = 1;  /* 使能控制 */
 }
 
 void Task_Run(void)
 {
+    /* 控制在定时中断里做，这里只检查是否完成 */
     if (finished) return;
-
-    switch (state) {
-
-    case STATE_LINE_FOLLOW: {
-        int8_t cur_type = step_types[step_idx];
-
-        if (cur_type == 0) {
-            /* 白区直线 */
-            StraightStep();
-            if (IsStraightDone()) {
-                straight_ms = 0;
-                state = STATE_ARRIVED;
-            }
-        } else {
-            /* 半圆弧前的循迹段 */
-            float abs_err = LineFollowStep();
-            if (abs_err > CURVE_ENTER_THRESH) {
-                curve_enter_cnt++;
-                if (curve_enter_cnt >= CURVE_ENTER_COUNT) {
-                    state = STATE_SEMI_TURN;
-                    Gyro_Reset();
-                    turn_integral = 0.0f;
-                    turn_prev_error = 0.0f;
-                    curve_enter_cnt = 0;
-                }
-            } else {
-                curve_enter_cnt = 0;
-            }
-        }
-        break;
-    }
-
-    case STATE_SEMI_TURN: {
-        TurnDir dir = (step_types[step_idx] > 0) ? TURN_RIGHT : TURN_LEFT;
-        SemiTurnStep(dir);
-        if (IsSemiTurnDone(dir)) {
-            state = STATE_ARRIVED;
-        }
-        break;
-    }
-
-    case STATE_ARRIVED: {
-        SignalArrival();
-        Motor_SetTarget(BASE_SPEED * 0.5f, BASE_SPEED * 0.5f);
-        delay_ms(POINT_DELAY_MS);
-        EnterNextStep();
-        break;
-    }
-
-    case STATE_STOP: {
-        NVIC_DisableIRQ(MOTOR_PID_INST_INT_IRQN);
-        Motor_Stop();
-        for (int i = 0; i < 3; i++) {
-            Buzzer_ShortBeep();
-            delay_ms(100);
-        }
-        finished = 1;
-        state = STATE_IDLE;
-        break;
-    }
-
-    case STATE_IDLE:
-    default:
-        break;
-    }
 }
 
 uint8_t Task_IsFinished(void)
 {
     return finished;
+}
+
+/* ========== 定时中断处理（替代 motor.c 的中断） ========== */
+void MOTOR_PID_INST_IRQHandler(void)
+{
+    switch (DL_Timer_getPendingInterrupt(MOTOR_PID_INST))
+    {
+    case DL_TIMER_IIDX_LOAD:
+        Control();
+        break;
+    default:
+        break;
+    }
 }
