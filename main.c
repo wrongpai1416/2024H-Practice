@@ -68,9 +68,9 @@
 #include "encoder.h"
 #include "ir_sensor.h"
 #include "gyro.h"
+#include "mpu6050.h"
 #include "buzzer.h"
 #include "task.h"
-#include <stdio.h>
 
 /* ========================================
  *  改这里选任务：0=调试 / 1 / 2 / 3 / 4
@@ -80,62 +80,68 @@
 int main(void)
 {
     SYSCFG_DL_init();
-
     OLED_Init();
     Encoder_Init();
 
-    /* ===== TASK_NUM=0: 编码器+陀螺仪调试 ===== */
+    /* ===== TASK_NUM=0: 编码器+陀螺仪+循迹调试 ===== */
     if (TASK_NUM == 0) {
         Gyro_Init();
-
-        OLED_Clear();
-        OLED_ShowString(0, 0, (uint8_t *)"DEBUG", 16);
-        OLED_Refresh();
-        delay_ms(500);
+        IR_Init();
+        Buzzer_ShortBeep();
 
         while (1) {
+            Gyro_Update(0.01f);
+
             int32_t l = encoder_left_cnt;
             int32_t r = encoder_right_cnt;
             float yaw = Gyro_GetYaw();
 
-            /* 整数部分和小数部分 */
             int32_t yaw_i = (int32_t)yaw;
             int32_t yaw_f = (int32_t)((yaw - (float)yaw_i) * 10);
             if (yaw_f < 0) yaw_f = -yaw_f;
 
+            uint8_t s[8];
+            IR_Read(s);
+
             OLED_Clear();
 
-            /* 第一行：L 编码器 */
-            OLED_ShowString(0, 0, (uint8_t *)"L:", 16);
-            if (l < 0) {
+            /* 第0行：yaw */
+            OLED_ShowString(0, 0, (uint8_t *)"Y:", 16);
+            if (yaw_i < 0) {
                 OLED_ShowString(16, 0, (uint8_t *)"-", 16);
-                OLED_ShowNum(24, 0, (uint32_t)(-l), 6, 16);
+                OLED_ShowNum(24, 0, (uint32_t)(-yaw_i), 3, 16);
             } else {
-                OLED_ShowNum(16, 0, (uint32_t)l, 7, 16);
+                OLED_ShowNum(16, 0, (uint32_t)yaw_i, 4, 16);
+            }
+            OLED_ShowString(48, 0, (uint8_t *)".", 16);
+            OLED_ShowNum(56, 0, (uint32_t)yaw_f, 1, 16);
+
+            /* 第一行：L 编码器 */
+            OLED_ShowString(0, 16, (uint8_t *)"L:", 16);
+            if (l < 0) {
+                OLED_ShowString(16, 16, (uint8_t *)"-", 16);
+                OLED_ShowNum(24, 16, (uint32_t)(-l), 6, 16);
+            } else {
+                OLED_ShowNum(16, 16, (uint32_t)l, 7, 16);
             }
 
             /* 第二行：R 编码器 */
-            OLED_ShowString(0, 16, (uint8_t *)"R:", 16);
+            OLED_ShowString(0, 32, (uint8_t *)"R:", 16);
             if (r < 0) {
-                OLED_ShowString(16, 16, (uint8_t *)"-", 16);
-                OLED_ShowNum(24, 16, (uint32_t)(-r), 6, 16);
+                OLED_ShowString(16, 32, (uint8_t *)"-", 16);
+                OLED_ShowNum(24, 32, (uint32_t)(-r), 6, 16);
             } else {
-                OLED_ShowNum(16, 16, (uint32_t)r, 7, 16);
+                OLED_ShowNum(16, 32, (uint32_t)r, 7, 16);
             }
 
-            /* 第三行：陀螺仪 yaw */
-            OLED_ShowString(0, 32, (uint8_t *)"Y:", 16);
-            if (yaw_i < 0) {
-                OLED_ShowString(16, 32, (uint8_t *)"-", 16);
-                OLED_ShowNum(24, 32, (uint32_t)(-yaw_i), 3, 16);
-            } else {
-                OLED_ShowNum(16, 32, (uint32_t)yaw_i, 4, 16);
+            /* 第三行：8路循迹传感器 1/0 */
+            OLED_ShowString(0, 48, (uint8_t *)"S:", 16);
+            for (uint8_t i = 0; i < 8; i++) {
+                OLED_ShowNum(16 + i * 8, 48, s[i], 1, 16);
             }
-            OLED_ShowString(40, 32, (uint8_t *)".", 16);
-            OLED_ShowNum(48, 32, (uint32_t)yaw_f, 1, 16);
 
             OLED_Refresh();
-            delay_ms(200);
+            delay_ms(100);
         }
     }
 
@@ -143,6 +149,7 @@ int main(void)
     Motor_Init();
     Buzzer_Init();
     IR_Init();
+    Buzzer_ShortBeep();
 
     OLED_Clear();
     OLED_ShowString(0, 0, (uint8_t *)"Task", 16);
@@ -165,6 +172,11 @@ int main(void)
     OLED_Clear();
     OLED_ShowString(0, 0, (uint8_t *)"Done!", 16);
     OLED_Refresh();
+
+    /* 跑完响两声 */
+    Buzzer_ShortBeep();
+    delay_ms(200);
+    Buzzer_ShortBeep();
 
     while (1) {}
 }

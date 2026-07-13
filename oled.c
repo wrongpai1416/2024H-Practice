@@ -27,16 +27,16 @@ void OLED_DisplayTurn(uint8_t i)
 }
 
 // ========== GPIO 模拟 I2C 底层函数 ==========
-static inline void I2C_SDA_H(void) { DL_GPIO_setPins(I2C_PORT, I2C_SDA_PIN); }
-static inline void I2C_SDA_L(void) { DL_GPIO_clearPins(I2C_PORT, I2C_SDA_PIN); }
-static inline void I2C_SCL_H(void) { DL_GPIO_setPins(I2C_PORT, I2C_SCL_PIN); }
-static inline void I2C_SCL_L(void) { DL_GPIO_clearPins(I2C_PORT, I2C_SCL_PIN); }
+static inline void I2C_SDA_H(void) { DL_GPIO_setPins(OLED_I2C_PORT, OLED_I2C_SDA_PIN); }
+static inline void I2C_SDA_L(void) { DL_GPIO_clearPins(OLED_I2C_PORT, OLED_I2C_SDA_PIN); }
+static inline void I2C_SCL_H(void) { DL_GPIO_setPins(OLED_I2C_PORT, OLED_I2C_SCL_PIN); }
+static inline void I2C_SCL_L(void) { DL_GPIO_clearPins(OLED_I2C_PORT, OLED_I2C_SCL_PIN); }
 
 // SDA 切换为输入（读取模式）
 static void I2C_SDA_Input(void)
 {
-    DL_GPIO_disableOutput(I2C_PORT, I2C_SDA_PIN);
-    DL_GPIO_initDigitalInputFeatures(I2C_SDA_IOMUX,
+    DL_GPIO_disableOutput(OLED_I2C_PORT, OLED_I2C_SDA_PIN);
+    DL_GPIO_initDigitalInputFeatures(OLED_I2C_SDA_IOMUX,
         DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_NONE,
         DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
 }
@@ -44,13 +44,13 @@ static void I2C_SDA_Input(void)
 // SDA 切换回输出模式
 static void I2C_SDA_Output(void)
 {
-    DL_GPIO_initDigitalOutput(I2C_SDA_IOMUX);
-    DL_GPIO_enableOutput(I2C_PORT, I2C_SDA_PIN);
+    DL_GPIO_initDigitalOutput(OLED_I2C_SDA_IOMUX);
+    DL_GPIO_enableOutput(OLED_I2C_PORT, OLED_I2C_SDA_PIN);
 }
 
 static inline uint8_t I2C_SDA_Read(void)
 {
-    return (DL_GPIO_readPins(I2C_PORT, I2C_SDA_PIN) != 0) ? 1 : 0;
+    return (DL_GPIO_readPins(OLED_I2C_PORT, OLED_I2C_SDA_PIN) != 0) ? 1 : 0;
 }
 
 static inline void I2C_Delay(void)

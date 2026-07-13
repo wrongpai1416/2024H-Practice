@@ -1,255 +1,225 @@
 /*
- * H题自动行驶小车 - 8路循迹版
+ * H题自动行驶小车 - 基于 Jamie 答案的控制逻辑
  *
- * 控制方式：定时中断里做所有控制（循迹/直线 + 速度PID）
- *
- * =============================================
- *  改这里选任务：1 / 2 / 3 / 4
- * =============================================
- *  TASK_NUM 在 main.c 里
- *
- * =============================================
- *  可调参数速查
- * =============================================
- *
- *  【循迹速度】 → 第 40 行
- *    Speed_Middle = 30  ← 基础速度（PWM占空比 0~3800）
- *
- *  【循迹力度】 → 第 43 行
- *    KP_LINE = 10       ← 循迹比例系数，太大抖，太小偏
- *
- *  【速度PID】 → 第 46~48 行
- *    Kp1=40, Ki1=0.13, Kd1=0.1  ← 速度环PID
- *
- *  【直线段距离】 → 第 54~55 行
- *    DIST_AB_PULSES = 3000  ← A到B编码器脉冲数
- *    DIST_CD_PULSES = 3000  ← C到D编码器脉冲数
- *
- *  【传感器阈值】 → 第 58~62 行
- *    Black_CNT = 30   ← 连续检测到黑线N次才判定到达
- *    White_CNT = 1000 ← 连续检测到白区N次才判定离开
+ * 控制方式：位置式 PID 三层串级
+ *   里程 PID → 基础速度
+ *   角度 PID → 航向修正（陀螺仪）
+ *   速度 PID → 左右轮独立闭环
  */
 
 #include "task.h"
 #include "motor.h"
 #include "ir_sensor.h"
+#include "gyro.h"
+#include "pid.h"
 #include "buzzer.h"
 #include "oled.h"
 #include "delay.h"
 #include "encoder.h"
+#include <math.h>
 
 /* ---------- 速度参数 ---------- */
-#define Speed_Middle    10.0f       /* 基础速度（PWM占空比） */
-#define Limit           2000        /* PWM限幅 */
-#define KP_LINE         8.0f       /* 循迹比例系数 */
+#define TRACK_SPEED     3.0f        /* 循迹基础速度 */
+#define PWM_LIMIT       2000.0f     /* PWM 限幅 */
 
-/* ---------- 速度PID（增量式） ---------- */
-#define Kp1             20.0f
-#define Ki1             0.1f
-#define Kd1             0.05f
+/* ---------- 循迹 PID ---------- */
+#define TRACK_KP        14.0f
 
-/* ---------- 直线段距离（编码器脉冲数，需要实测） ---------- */
-#define DIST_AB_PULSES  2400        /* A→B 脉冲数 */
-#define DIST_CD_PULSES  2400        /* C→D 脉冲数 */
+/* ---------- 里程 PID ---------- */
+#define MILEAGE_KP      4.0f
+#define MILEAGE_KI      0.1f
 
-/* ---------- 分段判定阈值 ---------- */
-#define Black_CNT       30          /* 连续检测到黑线次数 */
-#define White_CNT       1000        /* 连续检测到白区次数 */
+/* ---------- 直行角度 PID（Jamie 参数） ---------- */
+#define STRAIGHT_KP     0.22f
+#define STRAIGHT_KD     0.91f
 
-/* ---------- flag 定义 ----------
- * 0 = 停止
- * 1 = AB段（白区直线，编码器计距离）
- * 2 = BC段（半圆弧，循迹）
- * 3 = CD段（白区直线，编码器计距离）
- * 4 = DA段（半圆弧，循迹）
- * ---------------------------- */
+/* ---------- 速度 PID ---------- */
+#define SPEED_KP        10.0f
+#define SPEED_KI        5.0f
+#define SPEED_KD        3.0f
 
-static volatile int flag = 0;           /* 当前段 */
-static volatile int flag_en = 0;        /* 使能标志 */
+/* ---------- 里程参数 ---------- */
+#define DIST_AB_PULSES  1600        /* A→B 脉冲数（需实测） */
+
+/* ---------- 分段判定 ---------- */
+#define Black_CNT       30
+#define White_CNT       1000
+
+/* ---------- flag 定义 ---------- */
+static volatile int flag = 0;
+static volatile int flag_en = 0;
 static volatile uint8_t finished = 0;
 
-/* 编码器速度（10ms 内脉冲数） */
-static volatile int32_t EncoderA_VEL = 0;  /* 左轮速度 */
-static volatile int32_t EncoderB_VEL = 0;  /* 右轮速度 */
+/* PID 实例 */
+static PID_Controller speed_pid[2];     /* 左右轮速度 */
+static PID_Controller mileage_pid;      /* 里程 */
+static PID_Controller straight_pid;     /* 航向 */
+static PID_Controller track_pid;        /* 循迹 */
 
-/* 增量式PID 状态 */
-static float pid_left_pwm = 0;
-static float pid_right_pwm = 0;
+/* 陀螺仪目标角度 */
+static float target_yaw = 0;
 
-/* ---------- 增量式PID ---------- */
-static float PID_Inc(float Encoder, float Target, float *last_bias, float *last2_bias)
-{
-    float Bias = Target - Encoder;
-    float Pwm = Kp1 * (Bias - *last_bias) + Ki1 * Bias + Kd1 * (Bias - 2 * (*last_bias) + (*last2_bias));
-    *last2_bias = *last_bias;
-    *last_bias = Bias;
-    return Pwm;
-}
+/* 编码器速度 */
+static float actual_speed[2] = {0, 0};
 
 /* ---------- 限幅 ---------- */
-static float PWM_Limit(float IN, float max, float min)
+static float clamp(float val, float min, float max)
 {
-    if (IN > max) return max;
-    if (IN < min) return min;
-    return IN;
+    if (val > max) return max;
+    if (val < min) return min;
+    return val;
 }
 
-/* ---------- 设置电机PWM（直接操作方向引脚+PWM） ---------- */
-static void Set_Pwm(int Left, int Right)
+/* ---------- 设置电机 PWM ---------- */
+static void Set_Pwm(int left, int right)
 {
-    if (Left > 0) {
+    left  = (int)clamp((float)left,  -PWM_LIMIT, PWM_LIMIT);
+    right = (int)clamp((float)right, -PWM_LIMIT, PWM_LIMIT);
+
+    if (left > 0) {
         DL_GPIO_setPins(MOTOR_AIN1_PORT, MOTOR_AIN1_PIN);
         DL_GPIO_clearPins(MOTOR_AIN2_PORT, MOTOR_AIN2_PIN);
     } else {
         DL_GPIO_clearPins(MOTOR_AIN1_PORT, MOTOR_AIN1_PIN);
         DL_GPIO_setPins(MOTOR_AIN2_PORT, MOTOR_AIN2_PIN);
     }
-    DL_TimerG_setCaptureCompareValue(PWMAB_INST, (uint32_t)(Left > 0 ? Left : -Left),
+    DL_TimerG_setCaptureCompareValue(PWMAB_INST, (uint32_t)(left > 0 ? left : -left),
                                      DL_TIMER_CC_0_INDEX);
 
-    if (Right > 0) {
+    if (right > 0) {
         DL_GPIO_setPins(MOTOR_BIN1_PORT, MOTOR_BIN1_PIN);
         DL_GPIO_clearPins(MOTOR_BIN2_PORT, MOTOR_BIN2_PIN);
     } else {
         DL_GPIO_clearPins(MOTOR_BIN1_PORT, MOTOR_BIN1_PIN);
         DL_GPIO_setPins(MOTOR_BIN2_PORT, MOTOR_BIN2_PIN);
     }
-    DL_TimerG_setCaptureCompareValue(PWMAB_INST, (uint32_t)(Right > 0 ? Right : -Right),
+    DL_TimerG_setCaptureCompareValue(PWMAB_INST, (uint32_t)(right > 0 ? right : -right),
                                      DL_TIMER_CC_1_INDEX);
 }
 
-/* ---------- 8路循迹加权求和（参考 CAR/Sensor.c） ----------
- * S1=最右(+12), S2=+9, S3=+7, S4=+3,
- * S5=-3, S6=-7, S7=-9, S8=最左(-12)
- * 返回值：正=线偏右，负=线偏左
- * ----------------------------------------------- */
+/* ---------- 读取编码器速度（10ms 调用一次） ---------- */
+static void update_encoder(void)
+{
+    static int32_t last_left = 0, last_right = 0;
+    int32_t cur_left  = encoder_left_cnt;
+    int32_t cur_right = encoder_right_cnt;
+    actual_speed[0] = (float)(cur_left  - last_left);
+    actual_speed[1] = (float)(cur_right - last_right);
+    last_left  = cur_left;
+    last_right = cur_right;
+}
+
+/* ---------- 角度误差（处理 ±180 跨越） ---------- */
+static float calc_angle_error(float target, float current)
+{
+    float error = target - current;
+    if (error >  180.0f) error -= 360.0f;
+    if (error < -180.0f) error += 360.0f;
+    return error;
+}
+
+/* ---------- 8路循迹加权求和 ---------- */
 static int Incremental_Quantity(void)
 {
     uint8_t v[IR_NUM];
     IR_Read(v);
-
     int value = 0;
-    if (v[0]) value += 12;   /* S1 最右 */
-    if (v[1]) value += 9;    /* S2 */
-    if (v[2]) value += 7;    /* S3 */
-    if (v[3]) value += 3;    /* S4 */
-    if (v[4]) value -= 3;    /* S5 */
-    if (v[5]) value -= 7;    /* S6 */
-    if (v[6]) value -= 9;    /* S7 */
-    if (v[7]) value -= 12;   /* S8 最左 */
+    if (v[0]) value += 12;
+    if (v[1]) value += 9;
+    if (v[2]) value += 7;
+    if (v[3]) value += 3;
+    if (v[4]) value -= 3;
+    if (v[5]) value -= 7;
+    if (v[6]) value -= 9;
+    if (v[7]) value -= 12;
     return value;
 }
 
-/* ---------- 读取编码器速度（10ms 调用一次） ---------- */
-static void Read_Encoder(void)
-{
-    static int32_t last_left = 0, last_right = 0;
-
-    int32_t cur_left = encoder_left_cnt;
-    int32_t cur_right = encoder_right_cnt;
-
-    EncoderA_VEL = cur_left - last_left;
-    EncoderB_VEL = cur_right - last_right;
-
-    last_left = cur_left;
-    last_right = cur_right;
-}
-
-/* ---------- 分段判断（参考 CAR/Sensor.c Follow_Route） ---------- */
+/* ---------- 分段判断 ---------- */
 static void Follow_Route(void)
 {
     static int cnt = 0;
     uint8_t v[IR_NUM];
 
-    /* 任务1：A→B 直线 */
     if (flag == 1) {
-        /* 编码器距离到了 */
         if (encoder_left_cnt >= DIST_AB_PULSES) {
-            flag = 0;  /* 停止 */
+            flag = 0;
             finished = 1;
         }
     }
-    /* 任务2/3/4 的 BC 段（半圆弧循迹） */
     else if (flag == 2) {
         IR_Read(v);
-        /* 全部白 → 离开黑线 → 到达下一个点 */
         if (!(v[0] || v[1] || v[2] || v[3] || v[4] || v[5] || v[6] || v[7])) {
             cnt++;
-            if (cnt > White_CNT) {
-                flag = 3;  /* 进入 CD 段 */
-                cnt = 0;
-            }
-        } else {
-            cnt = 0;
-        }
+            if (cnt > White_CNT) { flag = 3; cnt = 0; }
+        } else { cnt = 0; }
     }
-    /* CD 段（白区直线） */
     else if (flag == 3) {
-        if (encoder_left_cnt >= DIST_AB_PULSES + DIST_CD_PULSES) {
-            flag = 4;  /* 进入 DA 段 */
+        if (encoder_left_cnt >= DIST_AB_PULSES * 2) {
+            flag = 4;
         }
     }
-    /* DA 段（半圆弧循迹） */
     else if (flag == 4) {
         IR_Read(v);
         if (!(v[0] || v[1] || v[2] || v[3] || v[4] || v[5] || v[6] || v[7])) {
             cnt++;
-            if (cnt > White_CNT) {
-                flag = 0;  /* 一圈完成 */
-                finished = 1;
-                cnt = 0;
-            }
-        } else {
-            cnt = 0;
-        }
+            if (cnt > White_CNT) { flag = 0; finished = 1; cnt = 0; }
+        } else { cnt = 0; }
     }
 }
 
-/* ---------- 定时中断中的控制函数（参考 CAR/control.c Control） ---------- */
+/* ========== 定时中断中的控制函数（10ms） ========== */
 static void Control(void)
 {
-    float TargetA, TargetB;
-    float bias = 0;
-
-    /* 分段判断 */
     Follow_Route();
+    update_encoder();
+    Gyro_Update(0.01f);
 
     if (flag == 0 || !flag_en) {
         Set_Pwm(0, 0);
-        pid_left_pwm = 0;
-        pid_right_pwm = 0;
+        PID_Reset(&speed_pid[0]);
+        PID_Reset(&speed_pid[1]);
         return;
     }
 
-    /* 根据当前段选择控制方式 */
+    float target_speed[2];
+
     if (flag == 1 || flag == 3) {
-        /* 白区直线：直走，不加循迹修正 */
-        bias = -3;
+        /* ---- 白区直线：里程PID + 角度PID（Jamie 方式） ---- */
+
+        /* 1. 里程 PID → 基础速度 */
+        mileage_pid.target = DIST_AB_PULSES;
+        float base_speed = PID_Calculate(&mileage_pid, (float)encoder_left_cnt);
+
+        /* 2. 角度 PID → 修正量 */
+        float yaw_err = calc_angle_error(target_yaw, Gyro_GetYaw());
+        straight_pid.target = 0.0f;
+        float correction = PID_Calculate(&straight_pid, -yaw_err);
+
+        /* 3. 左右轮目标速度 */
+        target_speed[0] = base_speed + correction;
+        target_speed[1] = base_speed - correction;
+
     } else if (flag == 2 || flag == 4) {
-        /* 半圆弧：循迹 */
-        bias = KP_LINE * (float)Incremental_Quantity();
+        /* ---- 半圆弧：循迹 ---- */
+        float bias = TRACK_KP * (float)Incremental_Quantity();
+        target_speed[0] = TRACK_SPEED + bias;
+        target_speed[1] = TRACK_SPEED - bias;
     }
 
-    /* 计算目标速度 */
-    TargetA = Speed_Middle - bias;   /* 左轮 */
-    TargetB = Speed_Middle + bias;   /* 右轮 */
-
-    /* 读取编码器 */
-    Read_Encoder();
-
-    /* 增量式PID */
-    static float last_bias_a = 0, last2_bias_a = 0;
-    static float last_bias_b = 0, last2_bias_b = 0;
-
-    pid_left_pwm  += PID_Inc((float)EncoderA_VEL, TargetA, &last_bias_a, &last2_bias_a);
-    pid_right_pwm += PID_Inc((float)EncoderB_VEL, TargetB, &last_bias_b, &last2_bias_b);
-
-    /* 限幅 */
-    pid_left_pwm  = PWM_Limit(pid_left_pwm, Limit, -Limit);
-    pid_right_pwm = PWM_Limit(pid_right_pwm, Limit, -Limit);
-
-    /* 输出 */
-    Set_Pwm((int)pid_left_pwm, (int)pid_right_pwm);
+    /* 速度 PID → PWM 输出 */
+    for (int i = 0; i < 2; i++) {
+        speed_pid[i].target = target_speed[i];
+        float pwm = PID_Calculate(&speed_pid[i], actual_speed[i]);
+        /* 限幅 */
+        if (pwm >  PWM_LIMIT) pwm =  PWM_LIMIT;
+        if (pwm < -PWM_LIMIT) pwm = -PWM_LIMIT;
+        /* 死区补偿 */
+        if (pwm > 0 && pwm < 200) pwm = 200;
+        if (pwm < 0 && pwm > -200) pwm = -200;
+        Set_Pwm((int)PID_Calculate(&speed_pid[0], actual_speed[0]),
+                (int)PID_Calculate(&speed_pid[1], actual_speed[1]));
+    }
 }
 
 /* ========== 外部接口 ========== */
@@ -258,29 +228,37 @@ void Task_Init(uint8_t task)
 {
     finished = 0;
     flag_en = 0;
-    pid_left_pwm = 0;
-    pid_right_pwm = 0;
     encoder_left_cnt = 0;
     encoder_right_cnt = 0;
 
+    /* 初始化 PID */
+    PID_Init(&speed_pid[0],  SPEED_KP, SPEED_KI, SPEED_KD,  PWM_LIMIT, PWM_LIMIT);
+    PID_Init(&speed_pid[1],  SPEED_KP, SPEED_KI, SPEED_KD,  PWM_LIMIT, PWM_LIMIT);
+    PID_Init(&mileage_pid,   MILEAGE_KP, MILEAGE_KI, 0.0f,   5.0f, 5.0f);
+    PID_Init(&straight_pid,  STRAIGHT_KP, 0.0f, STRAIGHT_KD, 10.0f, 10.0f);
+    PID_Init(&track_pid,     TRACK_KP, 0.0f, 0.0f,           30.0f, 30.0f);
+
+    /* 初始化陀螺仪 */
+    Gyro_Init();
+    target_yaw = Gyro_GetYaw();
+
     if (task == 1) {
-        flag = 1;   /* A→B 直线 */
+        flag = 1;
     } else if (task == 2) {
-        flag = 1;   /* A→B→C→D→A，从 AB 直线开始 */
+        flag = 1;
     } else if (task == 3) {
-        flag = 2;   /* A→C→B→D→A，从半圆弧开始 */
+        flag = 2;
     } else if (task == 4) {
-        flag = 2;   /* 4圈，从半圆弧开始 */
+        flag = 2;
     }
 
     Buzzer_ShortBeep();
     delay_ms(200);
-    flag_en = 1;  /* 使能控制 */
+    flag_en = 1;
 }
 
 void Task_Run(void)
 {
-    /* 控制在定时中断里做，这里只检查是否完成 */
     if (finished) return;
 }
 
@@ -289,7 +267,7 @@ uint8_t Task_IsFinished(void)
     return finished;
 }
 
-/* ========== 定时中断处理（替代 motor.c 的中断） ========== */
+/* ========== 定时中断 ========== */
 void MOTOR_PID_INST_IRQHandler(void)
 {
     switch (DL_Timer_getPendingInterrupt(MOTOR_PID_INST))
