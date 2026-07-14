@@ -49,6 +49,7 @@
 static volatile int flag = 0;
 static volatile int flag_en = 0;
 static volatile uint8_t finished = 0;
+volatile uint8_t current_task = 0;
 
 /* PID 实例 */
 static PID_Controller speed_pid[2];     /* 左右轮速度 */
@@ -168,9 +169,38 @@ static void Follow_Route(void)
     }
 }
 
+/* ========== Task5 纯循迹测试（独立，不走状态机） ========== */
+static void Control_Task5(void)
+{
+    uint8_t v[IR_NUM];
+    IR_Read(v);
+
+    /* 全白 = 没线 → 停 */
+    if (v[0] && v[1] && v[2] && v[3] && v[4] && v[5] && v[6] && v[7]) {
+        Set_Pwm(0, 0);
+        return;
+    }
+
+    /* 有线 → 用 Incremental_Quantity 加权偏差做比例差速 */
+    int bias = Incremental_Quantity();
+    float steer = (float)bias * 0.05f;      /* 缩放转向量 */
+
+    float left  = TRACK_SPEED + steer;
+    float right = TRACK_SPEED - steer;
+
+    Set_Pwm((int)(left  * 100.0f),
+            (int)(right * 100.0f));
+}
+
 /* ========== 定时中断中的控制函数（10ms） ========== */
 static void Control(void)
 {
+    /* Task5 单独处理，不走状态机 */
+    if (current_task == 5) {
+        Control_Task5();
+        return;
+    }
+
     Follow_Route();
     update_encoder();
     Gyro_Update(0.01f);
@@ -230,8 +260,17 @@ void Task_Init(uint8_t task)
 {
     finished = 0;
     flag_en = 0;
+    current_task = task;
     encoder_left_cnt = 0;
     encoder_right_cnt = 0;
+
+    /* Task5 是纯循迹测试，不需要 PID 和陀螺仪 */
+    if (task == 5) {
+        Buzzer_ShortBeep();
+        delay_ms(200);
+        flag_en = 1;
+        return;
+    }
 
     /* 初始化 PID */
     PID_Init(&speed_pid[0],  SPEED_KP, SPEED_KI, SPEED_KD,  PWM_LIMIT, PWM_LIMIT);
