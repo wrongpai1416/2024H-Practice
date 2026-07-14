@@ -1,5 +1,4 @@
 /*
- * H题自动行驶小车 - 基于 Jamie 答案的控制逻辑
  *
  * 控制方式：位置式 PID 三层串级
  *   里程 PID → 基础速度
@@ -120,7 +119,7 @@ static float calc_angle_error(float target, float current)
     return error;
 }
 
-/* ---------- 8路循迹加权求和 ---------- */
+/* ---------- 8路循迹加权求和（第一弧线） ---------- */
 static int Incremental_Quantity(void)
 {
     uint8_t v[IR_NUM];
@@ -135,6 +134,38 @@ static int Incremental_Quantity(void)
     if (v[6]) value -= 9;
     if (v[7]) value -= 12;
     return value;
+}
+
+/* ---------- 8路循迹加权求和（第二弧线，CAR用不同权重） ---------- */
+static int Incremental_Quantity4(void)
+{
+    uint8_t v[IR_NUM];
+    IR_Read(v);
+    int value = 0;
+    if (v[0]) value += 20;
+    if (v[1]) value += 10;
+    if (v[2]) value += 8;
+    if (v[3]) value += 5;
+    if (v[4]) value -= 5;
+    if (v[5]) value -= 8;
+    if (v[6]) value -= 10;
+    if (v[7]) value -= 20;
+    return value;
+}
+
+/* ---------- 增量式角度PID（CAR方案） ---------- */
+static float gyro_Last_bias = 0, gyro_Pwm = 0;
+static float GYRO_Control(float now, float target)
+{
+    float Bias = calc_angle_error(target, now);
+    gyro_Pwm += 1.0f * (Bias - gyro_Last_bias);   /* Kp3=1, 增量式 */
+    gyro_Last_bias = Bias;
+    return gyro_Pwm;
+}
+static void GYRO_Control_Reset(void)
+{
+    gyro_Last_bias = 0;
+    gyro_Pwm = 0;
 }
 
 /* ---------- 分段判断 ---------- */
@@ -207,7 +238,6 @@ static void Control_Task5(void)
 
 /* ========== Task2：直线+循迹，传感器触发切换 ========== */
 /*
- *  和 Jamie / CAR 完全一样的逻辑：
  *  0=直线 → 传感器看到黑线 → 1=循迹
  *  1=循迹 → 传感器全白(线消失) → 2=直线
  *  2=直线 → 传感器看到黑线 → 3=循迹
@@ -298,6 +328,111 @@ static void Control_Task2(void)
     }
 }
 
+/* ========== Task3：物理转弯+直行+循迹（直线和循迹完全复用Task2） ========== */
+/*
+ *  turn(-35°) → 直行到黑线 → 循迹到白线 → turn(-145°) → 直行到黑线 → 循迹到白线
+ *  状态：0=转弯  1=直线  2=弧线  3=转弯  4=直线  5=弧线
+ */
+#define TASK3_TURN1_DEG  (32.0f)
+#define TASK3_TURN2_DEG  (133.0f)
+
+static void Control_Task3(void)
+{
+    Gyro_Update(0.01f);
+
+    /* ---- 转弯：原地转到目标角度 ---- */
+    if (task2_state == 0 || task2_state == 3) {
+        float yaw_err = calc_angle_error(task2_init_yaw, Gyro_GetYaw());
+        float steer = 2.0f * yaw_err;
+        if (steer >  5.0f) steer =  5.0f;
+        if (steer < -5.0f) steer = -5.0f;
+
+        int pwm = (int)(steer * 100.0f);
+        if (pwm > 0 && pwm < 200) pwm = 200;
+        if (pwm < 0 && pwm > -200) pwm = -200;
+        Set_Pwm(pwm, -pwm);
+
+        if (yaw_err < 3.0f && yaw_err > -3.0f) {
+            Set_Pwm(0, 0);
+            task2_state++;
+            task2_start_enc = encoder_left_cnt;
+            task2_prev_yaw_err = 0;
+        }
+    }
+    /* ---- 直线：和Task2完全一样 ---- */
+    else if (task2_state == 1 || task2_state == 4) {
+        float yaw_err = calc_angle_error(task2_init_yaw, Gyro_GetYaw());
+        float steer = STRAIGHT_KP * yaw_err + STRAIGHT_KD * (yaw_err - task2_prev_yaw_err);
+        task2_prev_yaw_err = yaw_err;
+        if (steer >  3.0f) steer =  3.0f;
+        if (steer < -3.0f) steer = -3.0f;
+
+        float left  = STRAIGHT_SPEED + steer;
+        float right = STRAIGHT_SPEED - steer;
+        Set_Pwm((int)(left  * 100.0f),
+                (int)(right * 100.0f));
+
+        if (encoder_left_cnt - task2_start_enc >= TASK2_MIN_DIST) {
+            uint8_t v[IR_NUM];
+            IR_Read(v);
+            static uint16_t black_cnt = 0;
+            /* 只在中间传感器(S4/S5)看到黑线时才切换，确保车在线上 */
+            if (!v[3] || !v[4]) {
+                black_cnt++;
+                if (black_cnt > 3) {
+                    black_cnt = 0;
+                    task2_state++;
+                    task2_start_enc = encoder_left_cnt;
+                    task2_prev_yaw_err = 0;
+                }
+            } else {
+                black_cnt = 0;
+            }
+        }
+    }
+    /* ---- 弧线：和Task2完全一样 ---- */
+    else if (task2_state == 2 || task2_state == 5) {
+        uint8_t v[IR_NUM];
+        IR_Read(v);
+
+        static uint16_t white_cnt = 0;
+        if (v[0] && v[1] && v[2] && v[3] && v[4] && v[5] && v[6] && v[7]) {
+            white_cnt++;
+            if (white_cnt > 5 && encoder_left_cnt - task2_start_enc >= TASK2_MIN_DIST) {
+                white_cnt = 0;
+                task2_start_enc = encoder_left_cnt;
+                task2_prev_yaw_err = 0;
+
+                if (task2_state == 2) {
+                    task2_init_yaw += TASK3_TURN2_DEG;
+                    if (task2_init_yaw >  180.0f) task2_init_yaw -= 360.0f;
+                    if (task2_init_yaw < -180.0f) task2_init_yaw += 360.0f;
+                    task2_state = 3;
+                } else {
+                    finished = 1;
+                    return;
+                }
+            }
+            return;
+        }
+        white_cnt = 0;
+
+        /* 循迹：Task3从外侧进弧，方向取反 */
+        int bias = Incremental_Quantity();
+        if (v[0] && !v[1] && !v[2] && !v[3])
+            bias = -25;
+        else if (v[7] && !v[6] && !v[5] && !v[4])
+            bias =  25;
+
+        float gain = 0.1f * (TRACK_SPEED / 3.0f);
+        float steer = (float)bias * gain;
+        float left  = TRACK_SPEED + steer;
+        float right = TRACK_SPEED - steer;
+        Set_Pwm((int)(left  * 100.0f),
+                (int)(right * 100.0f));
+    }
+}
+
 /* ========== 定时中断中的控制函数（10ms） ========== */
 static void Control(void)
 {
@@ -310,6 +445,12 @@ static void Control(void)
     /* Task2 独立处理：直线+循迹，直接PWM */
     if (current_task == 2) {
         Control_Task2();
+        return;
+    }
+
+    /* Task3：转弯+循迹 */
+    if (current_task == 3) {
+        Control_Task3();
         return;
     }
 
@@ -392,6 +533,24 @@ void Task_Init(uint8_t task)
         task2_state = 0;
         task2_start_enc = 0;
         task2_prev_yaw_err = 0;
+        Buzzer_ShortBeep();
+        delay_ms(200);
+        flag_en = 1;
+        return;
+    }
+
+    /* Task3：Jamie方案，物理转弯+直行+循迹 */
+    if (task == 3) {
+        Gyro_Init();
+        delay_ms(500);
+        /* 起步航向 + 第一个转弯角度 = 转弯目标 */
+        task2_init_yaw = Gyro_GetYaw() + TASK3_TURN1_DEG;
+        if (task2_init_yaw >  180.0f) task2_init_yaw -= 360.0f;
+        if (task2_init_yaw < -180.0f) task2_init_yaw += 360.0f;
+        task2_state = 0;     /* 从转弯开始 */
+        task2_start_enc = 0;
+        task2_prev_yaw_err = 0;
+        GYRO_Control_Reset();
         Buzzer_ShortBeep();
         delay_ms(200);
         flag_en = 1;
