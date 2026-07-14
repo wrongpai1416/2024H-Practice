@@ -1,18 +1,18 @@
 #include "ir_sensor.h"
 
-/* 8路循迹传感器 GPIO 引脚 */
+/* 8路循迹传感器 GPIO 引脚（S1=最左, S8=最右） */
 static const struct {
     GPIO_Regs *port;
     uint32_t pin;
 } ir_sensors[IR_NUM] = {
-    { HUIDU_S1_PORT, HUIDU_S1_PIN },   /* PA18 - 最右 */
+    { HUIDU_S1_PORT, HUIDU_S1_PIN },   /* PA18 - 最左 */
     { HUIDU_S2_PORT, HUIDU_S2_PIN },   /* PB8  */
     { HUIDU_S3_PORT, HUIDU_S3_PIN },   /* PB9  */
     { HUIDU_S4_PORT, HUIDU_S4_PIN },   /* PA23 */
     { HUIDU_S5_PORT, HUIDU_S5_PIN },   /* PA24 */
     { HUIDU_S6_PORT, HUIDU_S6_PIN },   /* PA25 */
     { HUIDU_S7_PORT, HUIDU_S7_PIN },   /* PA26 */
-    { HUIDU_S8_PORT, HUIDU_S8_PIN },   /* PA27 - 最左 */
+    { HUIDU_S8_PORT, HUIDU_S8_PIN },   /* PA27 - 最右 */
 };
 
 void IR_Init(void) { /* SysConfig 已配置 GPIO 输入 */ }

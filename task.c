@@ -207,7 +207,8 @@ static void Control(void)
         target_speed[1] = TRACK_SPEED - bias;
     }
 
-    /* 速度 PID → PWM 输出 */
+    /* 速度 PID → PWM 输出（已修复 double PID） */
+    int pwm_left = 0, pwm_right = 0;
     for (int i = 0; i < 2; i++) {
         speed_pid[i].target = target_speed[i];
         float pwm = PID_Calculate(&speed_pid[i], actual_speed[i]);
@@ -217,9 +218,10 @@ static void Control(void)
         /* 死区补偿 */
         if (pwm > 0 && pwm < 200) pwm = 200;
         if (pwm < 0 && pwm > -200) pwm = -200;
-        Set_Pwm((int)PID_Calculate(&speed_pid[0], actual_speed[0]),
-                (int)PID_Calculate(&speed_pid[1], actual_speed[1]));
+        if (i == 0) pwm_left  = (int)pwm;
+        else        pwm_right = (int)pwm;
     }
+    Set_Pwm(pwm_left, pwm_right);
 }
 
 /* ========== 外部接口 ========== */
