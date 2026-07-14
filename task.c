@@ -19,7 +19,8 @@
 #include <math.h>
 
 /* ---------- 速度参数 ---------- */
-#define TRACK_SPEED     3.0f        /* 循迹基础速度 */
+#define TRACK_SPEED     10.0f        /* 循迹基础速度 */
+#define STRAIGHT_SPEED  6.0f         /* 直线基础速度 */
 #define PWM_LIMIT       2000.0f     /* PWM 限幅 */
 
 /* ---------- 循迹 PID ---------- */
@@ -30,7 +31,7 @@
 #define MILEAGE_KI      0.1f
 
 /* ---------- 直行角度 PID（Jamie 参数） ---------- */
-#define STRAIGHT_KP     0.22f
+#define STRAIGHT_KP     0.5f
 #define STRAIGHT_KD     0.91f
 
 /* ---------- 速度 PID ---------- */
@@ -181,9 +182,21 @@ static void Control_Task5(void)
         return;
     }
 
-    /* 有线 → 用 Incremental_Quantity 加权偏差做比例差速 */
+    /* 计算偏差：
+     *  中间传感器在线上 → 小偏差，柔和纠偏
+     *  只有外侧传感器在线上 → 大偏差，强制拉回中心 */
     int bias = Incremental_Quantity();
-    float steer = (float)bias * 0.05f;      /* 缩放转向量 */
+
+    /* 只有 s1(最左) 在线上 → 车偏右太多，强纠 */
+    if (v[0] && !v[1] && !v[2] && !v[3])
+        bias =  42;
+    /* 只有 s8(最右) 在线上 → 车偏左太多，强纠 */
+    else if (v[7] && !v[6] && !v[5] && !v[4])
+        bias = -42;
+
+    /* 转向增益随速度等比放大：速度越快纠偏越猛 */
+    float gain = 0.1f * (TRACK_SPEED / 3.0f);
+    float steer = (float)bias * gain;
 
     float left  = TRACK_SPEED + steer;
     float right = TRACK_SPEED - steer;
@@ -192,12 +205,110 @@ static void Control_Task5(void)
             (int)(right * 100.0f));
 }
 
+/* ========== Task2：直线+循迹，传感器触发切换 ========== */
+/*
+ *  和 Jamie / CAR 完全一样的逻辑：
+ *  0=直线 → 传感器看到黑线 → 1=循迹
+ *  1=循迹 → 传感器全白(线消失) → 2=直线
+ *  2=直线 → 传感器看到黑线 → 3=循迹
+ *  3=循迹 → 传感器全白(线消失) → 完成
+ */
+static volatile uint8_t task2_state = 0;
+static float task2_prev_yaw_err = 0;
+static int32_t task2_start_enc = 0;
+static float task2_init_yaw = 0;      /* AB方向，CD和AB平行，共用这个目标 */
+#define TASK2_MIN_DIST  200   /* 至少走200脉冲才允许切换 */
+#define TASK2_CD_OFFSET 195.0f  /* CD段相对AB的航向偏移，微调用 */
+
+static void Control_Task2(void)
+{
+    Gyro_Update(0.01f);
+
+    /* ---- 直线段：陀螺仪走直，检测到黑线就切循迹 ---- */
+    if (task2_state == 0 || task2_state == 2) {
+        /* AB 段用初始航向，CD 段用初始航向+偏移（弧线转了约180°） */
+        float target = (task2_state == 0) ? task2_init_yaw : task2_init_yaw + TASK2_CD_OFFSET;
+        if (target >  180.0f) target -= 360.0f;
+        float yaw_err = calc_angle_error(target, Gyro_GetYaw());
+        float steer = STRAIGHT_KP * yaw_err + STRAIGHT_KD * (yaw_err - task2_prev_yaw_err);
+        task2_prev_yaw_err = yaw_err;
+        if (steer >  3.0f) steer =  3.0f;
+        if (steer < -3.0f) steer = -3.0f;
+
+        float left  = STRAIGHT_SPEED + steer;
+        float right = STRAIGHT_SPEED - steer;
+        Set_Pwm((int)(left  * 100.0f),
+                (int)(right * 100.0f));
+
+        /* 走够最小距离后，检测到黑线 → 切到循迹 */
+        /* 实机：白=1，黑=0。有黑线 = 不是全白 */
+        if (encoder_left_cnt - task2_start_enc >= TASK2_MIN_DIST) {
+            uint8_t v[IR_NUM];
+            IR_Read(v);
+            static uint16_t black_cnt = 0;
+            uint8_t all_white = 1;
+            for (int i = 0; i < IR_NUM; i++) { if (!v[i]) all_white = 0; }
+            if (!all_white) {
+                black_cnt++;
+                if (black_cnt > 3) {
+                    black_cnt = 0;
+                    task2_state++;
+                    task2_start_enc = encoder_left_cnt;
+                    task2_prev_yaw_err = 0;
+                }
+            } else {
+                black_cnt = 0;
+            }
+        }
+    }
+    /* ---- 循迹段：跟线走，全白就切直线 ---- */
+    else if (task2_state == 1 || task2_state == 3) {
+        uint8_t v[IR_NUM];
+        IR_Read(v);
+
+        /* 连续全白(全1) + 走够最小距离 → 弧线结束 */
+        static uint16_t white_cnt = 0;
+        if (v[0] && v[1] && v[2] && v[3] && v[4] && v[5] && v[6] && v[7]) {
+            white_cnt++;
+            if (white_cnt > 5 && encoder_left_cnt - task2_start_enc >= TASK2_MIN_DIST) {
+                white_cnt = 0;
+                task2_state++;
+                task2_start_enc = encoder_left_cnt;
+                task2_prev_yaw_err = 0;
+                if (task2_state >= 4) { finished = 1; return; }
+            }
+            return;
+        }
+        white_cnt = 0;
+
+        /* 循迹：同 Task5 */
+        int bias = Incremental_Quantity();
+        if (v[0] && !v[1] && !v[2] && !v[3])
+            bias =  42;
+        else if (v[7] && !v[6] && !v[5] && !v[4])
+            bias = -42;
+
+        float gain = 0.1f * (TRACK_SPEED / 3.0f);
+        float steer = (float)bias * gain;
+        float left  = TRACK_SPEED + steer;
+        float right = TRACK_SPEED - steer;
+        Set_Pwm((int)(left  * 100.0f),
+                (int)(right * 100.0f));
+    }
+}
+
 /* ========== 定时中断中的控制函数（10ms） ========== */
 static void Control(void)
 {
     /* Task5 单独处理，不走状态机 */
     if (current_task == 5) {
         Control_Task5();
+        return;
+    }
+
+    /* Task2 独立处理：直线+循迹，直接PWM */
+    if (current_task == 2) {
+        Control_Task2();
         return;
     }
 
@@ -266,6 +377,19 @@ void Task_Init(uint8_t task)
 
     /* Task5 是纯循迹测试，不需要 PID 和陀螺仪 */
     if (task == 5) {
+        Buzzer_ShortBeep();
+        delay_ms(200);
+        flag_en = 1;
+        return;
+    }
+
+    /* Task2：直线+循迹，需要陀螺仪，不需要速度PID */
+    if (task == 2) {
+        Gyro_Init();
+        task2_init_yaw = Gyro_GetYaw();   /* 记住 AB 方向 */
+        task2_state = 0;
+        task2_start_enc = 0;
+        task2_prev_yaw_err = 0;
         Buzzer_ShortBeep();
         delay_ms(200);
         flag_en = 1;
