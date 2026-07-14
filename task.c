@@ -218,7 +218,7 @@ static float task2_prev_yaw_err = 0;
 static int32_t task2_start_enc = 0;
 static float task2_init_yaw = 0;      /* AB方向，CD和AB平行，共用这个目标 */
 #define TASK2_MIN_DIST  200   /* 至少走200脉冲才允许切换 */
-#define TASK2_CD_OFFSET 195.0f  /* CD段相对AB的航向偏移，微调用 */
+#define TASK2_CD_OFFSET 198.0f  /* CD段相对AB的航向偏移，微调用 */
 
 static void Control_Task2(void)
 {
@@ -283,10 +283,11 @@ static void Control_Task2(void)
 
         /* 循迹：同 Task5 */
         int bias = Incremental_Quantity();
+        /* 外侧传感器单独触发 → 适度纠偏，不要猛打 */
         if (v[0] && !v[1] && !v[2] && !v[3])
-            bias =  42;
+            bias =  25;
         else if (v[7] && !v[6] && !v[5] && !v[4])
-            bias = -42;
+            bias = -25;
 
         float gain = 0.1f * (TRACK_SPEED / 3.0f);
         float steer = (float)bias * gain;
@@ -386,6 +387,7 @@ void Task_Init(uint8_t task)
     /* Task2：直线+循迹，需要陀螺仪，不需要速度PID */
     if (task == 2) {
         Gyro_Init();
+        delay_ms(500);                     /* 等车稳了再抓航向 */
         task2_init_yaw = Gyro_GetYaw();   /* 记住 AB 方向 */
         task2_state = 0;
         task2_start_enc = 0;
