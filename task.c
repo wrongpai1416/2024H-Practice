@@ -349,7 +349,22 @@ static void Control_Task3(void)
     Gyro_Update(0.01f);
 
     /* ---- 转弯 ---- */
-    if (task2_state == 0 || task2_state == 3) {
+    if (task2_state == 0) {
+        /* 第一圈：转到中间传感器看到黑线才停（不依赖固定角度） */
+        int turn_pwm = 300;
+        Set_Pwm(turn_pwm, -turn_pwm);
+
+        uint8_t v[IR_NUM];
+        IR_Read(v);
+        if (!v[3] || !v[4]) {
+            Set_Pwm(0, 0);
+            task2_state = 1;
+            task2_start_enc = encoder_left_cnt;
+            task2_prev_yaw_err = 0;
+        }
+    }
+    else if (task2_state == 3) {
+        /* 第二圈及以后：转固定角度 */
         float yaw_err = calc_angle_error(task2_init_yaw, Gyro_GetYaw());
         float steer = 2.0f * yaw_err;
         if (steer >  5.0f) steer =  5.0f;
@@ -362,7 +377,7 @@ static void Control_Task3(void)
 
         if (yaw_err < 3.0f && yaw_err > -3.0f) {
             Set_Pwm(0, 0);
-            task2_state++;
+            task2_state = 4;
             task2_start_enc = encoder_left_cnt;
             task2_prev_yaw_err = 0;
         }
